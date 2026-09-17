@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>点字読み取り（自販機対応）</title>
+<style>
+body { font-family: sans-serif; background:#222; color:#eee; text-align:center; }
+video, canvas { width: 320px; height: 240px; background:#000; }
+button { padding:10px 20px; font-size:18px; margin:10px; }
+</style>
+</head>
+<body>
+
+<h2>点字読み取り（自販機対応）</h2>
+<video id="cam" autoplay playsinline></video><br>
+<button onclick="capture()">読み取る</button>
+<canvas id="cap"></canvas>
+<p id="out"></p>
+
+<script>
+// =========================
+// カメラ起動
+// =========================
+navigator.mediaDevices.getUserMedia({ video:true }).then(stream=>{
+    document.getElementById("cam").srcObject = stream;
+});
+
+// =========================
+// STEP1：点字領域抽出
+// =========================
+function extractBrailleArea(imageData){
+    const w=imageData.width, h=imageData.height, src=imageData.data;
+    const gray=new Uint8ClampedArray(w*h);
+
+    for(let i=0;i<w*h;i++){
+        const r=src[i*4], g=src[i*4+1], b=src[i*4+2];
+        gray[i]=r*0.299+g*0.587+b*0.114;
+    }
+
+    const refl=new Uint8ClampedArray(w*h);
+    for(let y=1;y<h-1;y++){
+        for(let x=1;x<w-1;x++){
+            const i=y*w+x;
+            const local=(gray[i]+gray[i-1]+gray[i+1]+gray[i-w]+gray[i+w])/5;
+            const v=gray[i]-local;
+            refl[i]=v<0?0:v;
+        }
+    }
+
+    let minX=w, minY=h, maxX=0, maxY=0;
+    for(let y=0;y<h;y++){
+        for(let x=0;x<w;x++){
+            const v=refl[y*w+x];
+            if(v>20){
+                if(x<minX)minX=x;
+                if(x>maxX)maxX=x;
+                if(y<minY)minY=y;
+                if(y>maxY)maxY=y;
+            }
+        }
+    }
+
+    const cw=maxX-minX+1, ch=maxY-minY+1;
+    const tmp=document.createElement("canvas");
+    tmp.width=w; tmp.height=h;
+    tmp.getContext("2d").putImageData(imageData,0,0);
+
+    const out=document.createElement("canvas");
+    out.width=cw; out.height=ch;
+    out.getContext("2d").drawImage(tmp,minX,minY,cw,ch,0,0,cw,ch);
+
+    return out.getContext("2d").getImageData(0,0,cw,ch);
+}
+
+// =========================
+// STEP2：点候補検出
+// =========================
+function detectDotCandidates(imageData){
+    const w=imageData.width, h=imageData.height, src=imageData.data;
+    const gray=new Uint8ClampedArray(w*h);
+
+    for(let i=0;i<w*h;i++){
+        const r=src[i*4], g=src[i*4+1], b=src[i*4+2];
+        gray[i]=r*0.299+g*0.587+b*0.114;
+    }
+
+    const shadow=new Uint8ClampedArray(w*h);
+    for(let y=1;y<h-1;y++){
+        for(let x=1;x<w-1;x++){
+            const up=gray[(y-1)*w+x];
+            const down=gray[(y+1)*w+x];
+            const v=down-up;
+            shadow[y*w+x]=v>15?v:0;
+        }
+    }
+
+    const list=[];
+    for(let y=0;y<h;y++){
+        for(let x=0;x<w;x++){
+            if(shadow[y*w+x]>20) list.push({x,y});
+        }
+    }
+    return list;
+}
+
+// =========================
+// STEP3：点の重心計算（6クラスタ）
+// =========================
+function computeDotCenters(list,w,h){
+    let centers=[
+        {x:w*0.33,y:h*0.20},{x:w*0.66,y:h*0.20},
+        {x:w*0.33,y:h*0.50},{x:w*0.66,y:h*0.50},
+        {x:w*0.33,y:h*0.80},{x:w*0.66,y:h*0.80}
+    ];
+
+    for(let iter=0;iter<10;iter++){
+        const g=[[],[],[],[],[],[]];
+        for(const p of list){
+            let best=0, bd=1e9;
+            for(let k=0;k<6;k++){
+                const c=centers[k];
+                const dx=p.x-c.x, dy=p.y-c.y;
+                const d=dx*dx+dy*dy;
+                if(d<bd){bd=d; best=k;}
+            }
+            g[best].push(p);
+        }
+        for(let k=0;k<6;k++){
+            if(g[k].length===0) continue;
+            let sx=0, sy=0;
+            for(const p of g[k]){ sx+=p.x; sy+=p.y; }
+            centers[k]={x:sx/g[k].length, y:sy/g[k].length};
+        }
+    }
+    return centers;
+}
+
+// =========================
+// STEP4：点の有無判定
+// =========================
+function detectDotPresence(centers,imageData){
+    const w=imageData.width, h=imageData.height, src=imageData.data;
+    const out=[];
+
+    for(const c of centers){
+        const cx=Math.floor(c.x), cy=Math.floor(c.y);
+        let up=0, dn=0, cu=0, cd=0;
+
+        for(let dy=-6;dy<=6;dy++){
+            for(let dx=-6;dx<=6;dx++){
+                const x=cx+dx, y=cy+dy;
+                if(x<0||x>=w||y<0||y>=h) continue;
+                const i=(y*w+x)*4;
+                const r=src[i], g=src[i+1], b=src[i+2];
+                const gr=r*0.299+g*0.587+b*0.114;
+                if(dy<0){ up+=gr; cu++; }
+                else if(dy>0){ dn+=gr; cd++; }
+            }
+        }
+
+        const diff=(dn/cd)-(up/cu);
+        out.push(diff>12?1:0);
+    }
+    return out;
+}
+
+// =========================
+// STEP5：6ビット化 → 辞書照合
+// =========================
+function bitsToCell(b){ return b.join(""); }
+
+function correctPattern(p){
+    if(!/^[01]{6}$/.test(p)) return "000000";
+    let b=p.split("");
+
+    const L=b.slice(0,3).join(""), R=b.slice(3).join("");
+    if(L==="000" && R!=="000") b=[...b.slice(3),...b.slice(0,3)];
+
+    const top=b[0]+b[1], mid=b[2]+b[3], bot=b[4]+b[5];
+    if(top==="00" && (mid!=="00"||bot!=="00")){
+        b=[b[4],b[5],b[2],b[3],b[0],b[1]];
+    }
+
+    return b.join("");
+}
+
+// ★一般的な点字辞書（完全準拠）
+const dict={
+    "100000":"あ","101000":"い","110000":"う","110100":"え","100100":"お",
+    "100010":"か","101010":"き","110010":"く","110110":"け","100110":"こ",
+    "100001":"さ","101001":"し","110001":"す","110101":"せ","100101":"そ",
+    "100011":"た","101011":"ち","110011":"つ","110111":"て","100111":"と",
+    "100010":"か","101010":"き","110010":"く","110110":"け","100110":"こ",
+    "101100":"ら","111000":"り","111100":"る","111010":"れ","101110":"ろ",
+    "000010":"ー","001011":"゛","001111":"゜","000101":"ゃ","000110":"ゅ","000011":"ょ",
+    "001001":"#","001000":"*"
+};
+
+// 数字辞書
+const numDict={
+    "100000":"1","101000":"2","110000":"3","110100":"4","100100":"5",
+    "100010":"6","101010":"7","110010":"8","110110":"9","100110":"0"
+};
+
+// 英字辞書（省略版）
+const enDict={
+    "100000":"a","101000":"b","110000":"c","110100":"d","100100":"e",
+    "100010":"f","101010":"g","110010":"h","110110":"i","100110":"j"
+};
+
+// =========================
+// STEP6：ステートマシン
+// =========================
+function decodeCells(cells){
+    let out="", mode="jp";
+
+    for(const c of cells){
+        if(c==="□"){ out+="□"; mode="jp"; continue; }
+        if(c==="#"){ mode="num"; continue; }
+        if(c==="*"){ mode="en"; continue; }
+
+        if(mode==="num"){
+            if(numDict[c]){ out+=numDict[c]; continue; }
+            mode="jp";
+        }
+
+        if(mode==="en"){
+            if(enDict[c]){ out+=enDict[c]; continue; }
+            mode="jp";
+        }
+
+        if(c==="゛"){ out=applyDakuten(out); continue; }
+        if(c==="゜"){ out=applyHandakuten(out); continue; }
+        if(c==="ゃ"||c==="ゅ"||c==="ょ"){ out=applyYouon(out,c); continue; }
+        if(c==="ー"){ out=applyChoon(out); continue; }
+
+        out+=c;
+    }
+    return out;
+}
+
+function applyDakuten(s){
+    if(!s) return s;
+    const m={"か":"が","き":"ぎ","く":"ぐ","け":"げ","こ":"ご",
+             "さ":"ざ","し":"じ","す":"ず","せ":"ぜ","そ":"ぞ",
+             "た":"だ","ち":"ぢ","つ":"づ","て":"で","と":"ど",
+             "は":"ば","ひ":"び","ふ":"ぶ","へ":"べ","ほ":"ぼ"};
+    const last=s.slice(-1);
+    return s.slice(0,-1)+(m[last]||last);
+}
+
+function applyHandakuten(s){
+    if(!s) return s;
+    const m={"は":"ぱ","ひ":"ぴ","ふ":"ぷ","へ":"ぺ","ほ":"ぽ"};
+    const last=s.slice(-1);
+    return s.slice(0,-1)+(m[last]||last);
+}
+
+function applyYouon(s,yo){
+    if(!s) return s;
+    const base={"き":"き","し":"し","ち":"ち","に":"に","ひ":"ひ",
+                "み":"み","り":"り","ぎ":"ぎ","じ":"じ","ぢ":"ぢ",
+                "び":"び","ぴ":"ぴ"};
+    const last=s.slice(-1);
+    if(base[last]) return s.slice(0,-1)+base[last]+yo;
+    return s+yo;
+}
+
+function applyChoon(s){
+    if(!s) return s;
+    return s+"ー";
+}
+
+// =========================
+// STEP7：読み上げ
+// =========================
+function speak(text){
+    if(!text) return;
+    const u=new SpeechSynthesisUtterance(text);
+    u.lang="ja-JP";
+    speechSynthesis.cancel();
+    speechSynthesis.speak(u);
+}
+
+// =========================
+// 全処理統合
+// =========================
+function capture(){
+    const cam=document.getElementById("cam");
+    const cap=document.getElementById("cap");
+    const ctx=cap.getContext("2d");
+    ctx.drawImage(cam,0,0,cap.width,cap.height);
+
+    const img=ctx.getImageData(0,0,cap.width,cap.height);
+
+    const area=extractBrailleArea(img);
+    const dots=detectDotCandidates(area);
+    const centers=computeDotCenters(dots,area.width,area.height);
+    const bits=detectDotPresence(centers,area);
+
+    const cell=bitsToCell(bits);
+    const corrected=correctPattern(cell);
+    const char=dict[corrected]||"□";
+
+    const text=decodeCells([char]);
+    document.getElementById("out").textContent=text;
+    speak(text);
+}
+</script>
+</body>
+</html>
